@@ -3,6 +3,7 @@ import re
 import sqlite3
 from datetime import datetime
 import asyncio
+import logging
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
@@ -66,7 +67,7 @@ def get_role_ids(guild_id):
     raw = get_setting(guild_id, "target_role_ids") or get_setting(guild_id, "target_role_id")
     if not raw:
         return []
-    values = [v.strip() for v in re.split(r"[,;\\s]+", raw) if v.strip()]
+    values = [v.strip() for v in re.split(r"[,;\s]+", raw) if v.strip()]
     return list(dict.fromkeys(int(v) for v in values if v.isdigit()))
 
 def make_embed(title, description="", color=0xA30D20):
@@ -320,7 +321,7 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
         for field, key in fields:
             value = field.value.strip()
             if key == "target_role_ids":
-                entries = [part.strip() for part in re.split(r"[,;\\s]+", value) if part.strip()]
+                entries = [part.strip() for part in re.split(r"[,;\s]+", value) if part.strip()]
                 if not entries or len(entries) > 20 or any(not part.isdigit() for part in entries):
                     return await interaction.response.send_message(
                         "Укажите от 1 до 20 числовых ID ролей через запятую.", ephemeral=True)
@@ -333,6 +334,16 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
 
 
 class AuditModal(discord.ui.Modal, title="Настройка канала аудита"):
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logging.exception("AuditModal error: %s", error, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("❌ Ошибка сохранения аудита. Проверьте логи.", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Ошибка сохранения аудита. Проверьте логи.", ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     audit_channel = discord.ui.TextInput(label="ID канала аудита", placeholder="Вставьте ID текстового канала")
 
     async def on_submit(self, interaction):
@@ -350,7 +361,22 @@ class AuditModal(discord.ui.Modal, title="Настройка канала ауд
 
 class SetupView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=180)
+        # Ephemeral views stay interactive for up to ~15 minutes.
+        super().__init__(timeout=840)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logging.exception("SetupView button error: %s", error, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Ошибка при открытии настроек. Повторите `/role_setup` и посмотрите логи Bothost.",
+                    ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "❌ Не удалось открыть настройки. Повторите `/role_setup` и проверьте логи Bothost.",
+                    ephemeral=True)
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(label="Настроить бота", emoji="⚙️", style=discord.ButtonStyle.primary)
     async def setup(self, interaction, button):
@@ -362,7 +388,13 @@ class SetupView(discord.ui.View):
     async def audit(self, interaction, button):
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
-        await interaction.response.send_modal(AuditModal())
+        try:
+            await interaction.response.send_modal(AuditModal())
+        except discord.HTTPException:
+            logging.exception("Failed to open AuditModal")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Не удалось открыть форму аудита. Повторите `/role_setup`.", ephemeral=True)
 
 class KarateliRoleBot(commands.Bot):
     async def setup_hook(self):
