@@ -94,12 +94,24 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
-        category_id = get_setting(guild.id, "ticket_category_id")
-        category = guild.get_channel(int(category_id)) if category_id.isdigit() else None
+        # All applications go to ONE configured text channel, without ticket creation.
+        requests_channel_id = get_setting(guild.id, "applications_channel_id")
+        requests_channel = guild.get_channel(int(requests_channel_id)) if requests_channel_id.isdigit() else None
+        if not isinstance(requests_channel, discord.TextChannel):
+            return await interaction.followup.send(
+                "❌ Канал для поступления заявок не настроен. Администрации нужно выполнить `/role_setup`.",
+                ephemeral=True)
         review_role_id = get_setting(guild.id, "review_role_id")
         review_role = guild.get_role(int(review_role_id)) if review_role_id.isdigit() else None
 
+        # Prevent multiple simultaneous active applications by one member.
         with db() as con:
+            existing = con.execute(
+                "SELECT id FROM requests WHERE guild_id=? AND user_id=? AND state='pending' LIMIT 1",
+                (guild.id, interaction.user.id)).fetchone()
+            if existing:
+                return await interaction.followup.send(
+                    f"У вас уже есть необработанная заявка №{existing['id']}.", ephemeral=True)
             cur = con.execute("""INSERT INTO requests
                 (guild_id,user_id,real_name,member_status,reason,created_at)
                 VALUES(?,?,?,?,?,?)""",
@@ -107,45 +119,29 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
                  self.member_status.value.strip(), self.reason.value.strip(), now()))
             request_id = cur.lastrowid
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
-                                                          read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
-                                                  read_message_history=True, manage_channels=True)
-        }
-        if review_role:
-            overwrites[review_role] = discord.PermissionOverwrite(
-                view_channel=True, send_messages=True, read_message_history=True
-            )
-
-        try:
-            ticket = await guild.create_text_channel(
-                name=f"запрос-роли-{request_id}-{safe_channel_name(interaction.user.display_name)}",
-                category=category if isinstance(category, discord.CategoryChannel) else None,
-                overwrites=overwrites, reason=f"Role request #{request_id}"
-            )
-        except discord.Forbidden:
-            return await interaction.followup.send(
-                "Не удалось создать приватный канал. Проверьте право бота «Управление каналами».",
-                ephemeral=True
-            )
-
-        with db() as con:
-            con.execute("UPDATE requests SET ticket_id=? WHERE id=?", (ticket.id, request_id))
-
-        e = make_embed("🎭 ЗАПРОС РОЛИ", color=0xD49B26)
-        e.add_field(name="Заявка", value=f"№{request_id}", inline=True)
+        e = make_embed("🎭 НОВАЯ ЗАЯВКА НА РОЛЬ", color=0xD49B26)
+        e.add_field(name="Номер", value=f"№{request_id}", inline=True)
         e.add_field(name="Заявитель", value=f"{interaction.user.mention}\n{self.real_name.value}", inline=True)
-        e.add_field(name="Кто заявитель", value=self.member_status.value, inline=True)
-        e.add_field(name="Дополнительная информация", value=self.reason.value or "Не указана", inline=False)
-        e.add_field(name="Подано", value=now(), inline=True)
-        await ticket.send(content=review_role.mention if review_role else None,
-                          embed=e, view=ReviewView(request_id))
+        e.add_field(name="Статус в семье", value=self.member_status.value, inline=True)
+        e.add_field(name="Дополнительно", value=self.reason.value or "Не указано", inline=False)
+        e.add_field(name="Дата подачи", value=now(), inline=True)
+        try:
+            message = await requests_channel.send(
+                content=review_role.mention if review_role else None,
+                embed=e, view=ReviewView(request_id),
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
+        except discord.HTTPException as exc:
+            with db() as con:
+                con.execute("DELETE FROM requests WHERE id=? AND state='pending'", (request_id,))
+            logging.exception("Cannot publish application %s: %s", request_id, exc)
+            return await interaction.followup.send(
+                "❌ Не удалось отправить заявку в канал. Проверьте разрешения бота на отправку сообщений и Embed.",
+                ephemeral=True)
+        with db() as con:
+            con.execute("UPDATE requests SET ticket_id=? WHERE id=?", (message.id, request_id))
         await interaction.followup.send(
-            f"✅ Заявка №{request_id} создана. Приватный канал: {ticket.mention}",
-            ephemeral=True
-        )
+            f"✅ Заявка №{request_id} отправлена в {requests_channel.mention}. Ожидайте решения.",
+            ephemeral=True)
 
 class RolePanel(discord.ui.View):
     def __init__(self):
@@ -305,7 +301,7 @@ class ReviewView(discord.ui.View):
 
 class SetupModal(discord.ui.Modal, title="Настройки бота запросов ролей"):
     panel_channel = discord.ui.TextInput(label="ID канала панели запроса роли")
-    ticket_category = discord.ui.TextInput(label="ID категории приватных заявок")
+    ticket_category = discord.ui.TextInput(label="ID канала, куда приходят заявки")
     reviewer_role = discord.ui.TextInput(label="ID роли старшего состава")
     target_role = discord.ui.TextInput(
         label="ID ролей для выдачи (через запятую)",
@@ -318,7 +314,7 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
         self.guild_id = guild_id
         for field, key in [
             (self.panel_channel, "panel_channel_id"),
-            (self.ticket_category, "ticket_category_id"),
+            (self.ticket_category, "applications_channel_id"),
             (self.reviewer_role, "review_role_id"),
             (self.target_role, "target_role_ids"),
             (self.nickname_tag, "nickname_tag")
@@ -329,7 +325,7 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
     async def on_submit(self, interaction):
         fields = [
             (self.panel_channel, "panel_channel_id"),
-            (self.ticket_category, "ticket_category_id"),
+            (self.ticket_category, "applications_channel_id"),
             (self.reviewer_role, "review_role_id"),
             (self.target_role, "target_role_ids"),
             (self.nickname_tag, "nickname_tag")
@@ -345,8 +341,15 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
             elif key != "nickname_tag" and value and not value.isdigit():
                 return await interaction.response.send_message(
                     f"Поле «{field.label}» должно содержать числовой ID.", ephemeral=True)
+            if key in {"panel_channel_id", "applications_channel_id"}:
+                target_channel = interaction.guild.get_channel(int(value)) if value.isdigit() else None
+                if not isinstance(target_channel, discord.TextChannel):
+                    return await interaction.response.send_message(
+                        f"В поле «{field.label}» укажите ID существующего текстового канала.", ephemeral=True)
             set_setting(interaction.guild_id, key, value)
-        await interaction.response.send_message("✅ Настройки сохранены.", ephemeral=True)
+        await interaction.response.send_message(
+            "✅ Настройки сохранены. Все заявки будут приходить в указанный текстовый канал, без создания каналов.",
+            ephemeral=True)
 
 
 class AuditModal(discord.ui.Modal, title="Настройка канала аудита"):
@@ -435,7 +438,7 @@ async def role_setup(interaction: discord.Interaction):
         return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
     await interaction.response.send_message(
         embed=make_embed("☠ КАРАТЕЛИ | НАСТРОЙКА ЗАПРОСА РОЛИ",
-                         "Настройте канал панели, категорию приватных заявок, проверяющих и несколько ролей для выдачи."),
+                         "Настройте канал панели, ОТДЕЛЬНЫЙ текстовый канал для поступления заявок, роль проверяющих и выдаваемые роли. Новые каналы бот создавать не будет."),
         view=SetupView(), ephemeral=True)
 
 @bot.tree.command(name="role_publish", description="Опубликовать отдельную панель запроса роли")
