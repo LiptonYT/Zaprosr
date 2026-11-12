@@ -267,7 +267,9 @@ class ReviewView(discord.ui.View):
 
             audit_id = get_setting(interaction.guild_id, "audit_channel_id")
             audit_channel = interaction.guild.get_channel(int(audit_id)) if audit_id.isdigit() else None
-            if audit_channel:
+            # Кадровый аудит получает только одобренные заявки.
+            # Отклонённые заявки и заявки на доработке там не публикуются.
+            if decision == "approved" and audit_channel:
                 try:
                     await audit_channel.send(embed=e)
                 except discord.HTTPException:
