@@ -84,6 +84,62 @@ def make_embed(title, description="", color=BRAND_RED, guild=None):
     return e
 
 
+
+def make_decision_dm(guild, req, request_id, decision, reviewer, role_names=None,
+                     new_nick=None, nickname_changed=False):
+    """DM-only presentation: never put role mentions in DMs (they show as unknown roles)."""
+    if decision == "approved":
+        heading = "✅  ВАША ЗАЯВКА ОДОБРЕНА"
+        subtitle = "ДОСТУП ПОДТВЕРЖДЁН"
+        description = (
+            "**Поздравляем!** Руководство рассмотрело вашу заявку и "
+            "подтвердило получение ролей.\n\n"
+            "Вы получили доступы в семье **КАРАТЕЛИ**."
+        )
+        color = BRAND_GREEN
+    elif decision == "rejected":
+        heading = "❌  ЗАЯВКА ОТКЛОНЕНА"
+        subtitle = "РЕШЕНИЕ РУКОВОДСТВА"
+        description = (
+            "Ваша заявка рассмотрена, но сейчас не одобрена.\n\n"
+            "Для уточнения причины обратитесь к руководству семьи."
+        )
+        color = BRAND_RED
+    else:
+        heading = "📝  ЗАЯВКА НА ДОРАБОТКЕ"
+        subtitle = "НЕОБХОДИМО УТОЧНЕНИЕ"
+        description = (
+            "Руководство рассмотрело заявку и запросило доработку.\n\n"
+            "Уточните необходимые сведения у старшего состава семьи."
+        )
+        color = BRAND_GOLD
+
+    embed = discord.Embed(
+        title=heading,
+        description=f"**{subtitle}**\n━━━━━━━━━━━━━━━━━━━━\n\n{description}",
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="📋 Номер заявки", value=f"`#{request_id:04d}`", inline=True)
+    embed.add_field(name="👤 Имя и фамилия", value=discord.utils.escape_markdown(req["real_name"])[:1000], inline=True)
+    embed.add_field(name="🎖️ Статус", value=discord.utils.escape_markdown(req["member_status"])[:1000], inline=False)
+
+    if decision == "approved":
+        # Show plain role names: guild role mentions do not resolve in private DMs.
+        display_roles = "\n".join(f"• {discord.utils.escape_markdown(name)}" for name in (role_names or []))
+        embed.add_field(name="🎁 Выданные роли", value=(display_roles or "Роли выданы")[:1024], inline=False)
+        if nickname_changed and new_nick:
+            embed.add_field(name="🏷️ Ваш новый никнейм", value=f"`{discord.utils.escape_markdown(new_nick)}`", inline=False)
+        elif new_nick:
+            embed.add_field(name="🏷️ Никнейм", value="Изменить не удалось: проверьте права и иерархию ролей бота.", inline=False)
+
+    embed.add_field(name="⚖️ Решение принял", value=discord.utils.escape_markdown(reviewer.display_name)[:1000], inline=True)
+    embed.add_field(name="🏰 Сервер", value=discord.utils.escape_markdown(guild.name)[:1000], inline=True)
+    embed.set_footer(text="☠️ КАРАТЕЛИ  •  FAMILY CONTROL  •  RMRP")
+    return embed
+
 def safe_channel_name(value):
     value = re.sub(r"[^a-zA-Zа-яА-ЯёЁ0-9_-]", "-", value.strip().lower())
     return (value[:45] or "request").strip("-")
@@ -209,6 +265,9 @@ class ReviewView(discord.ui.View):
 
             member = interaction.guild.get_member(req["user_id"])
             result_text = "Роли не изменялись."
+            granted_role_names = []
+            new_nick = None
+            nickname_changed = False
             color = BRAND_GOLD
             state_label = "НА ДОРАБОТКЕ"
 
@@ -247,6 +306,8 @@ class ReviewView(discord.ui.View):
                     nick_note = f"\n**Никнейм:** `{new_nick}`"
                 except discord.HTTPException:
                     nick_note = "\n⚠️ Никнейм изменить не удалось (права или иерархия ролей)."
+                granted_role_names = [role.name for role in roles]
+                nickname_changed = not bool("не удалось" in nick_note)
                 result_text = "Выданы роли: " + ", ".join(r.mention for r in roles) + nick_note
                 color = BRAND_GREEN
                 state_label = "ОДОБРЕНО"
@@ -293,17 +354,16 @@ class ReviewView(discord.ui.View):
 
             if member:
                 try:
-                    await member.send(embed=make_embed(
-                        f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} "
-                        "КАРАТЕЛИ  •  РЕШЕНИЕ ПО ЗАЯВКЕ",
-                        f"**Заявка:** №{self.request_id}\n"
-                        f"**Кто заявитель:** {req['member_status']}\n"
-                        f"**Решение:** {state_label}\n"
-                        f"**Рассмотрел:** {interaction.user.display_name}\n"
-                        f"**Дата:** {now()}\n\n{result_text}",
-                        color=color))
+                    await member.send(embed=make_decision_dm(
+                        interaction.guild, req, self.request_id,
+                        decision, interaction.user,
+                        role_names=granted_role_names,
+                        new_nick=new_nick,
+                        nickname_changed=nickname_changed,
+                    ))
                 except discord.HTTPException:
-                    pass
+                    logging.info("Не удалось доставить ЛС по заявке #%s (ЛС закрыты или нет доступа)",
+                                 self.request_id)
 
     @discord.ui.button(label="Одобрить", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
