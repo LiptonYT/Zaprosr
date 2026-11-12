@@ -82,8 +82,8 @@ def safe_channel_name(value):
 class RoleRequestModal(discord.ui.Modal, title="Заявление на получение роли"):
     real_name = discord.ui.TextInput(label="Имя и фамилия", placeholder="Например: Иван Иванов", max_length=80)
     member_status = discord.ui.TextInput(
-        label="Кто вы? Напишите: новичок / участник / возвращаюсь",
-        placeholder="Например: Новичок", max_length=60
+        label="Ваш статус в семье",
+        placeholder="Новичок / участник / возвращаюсь", max_length=60
     )
     reason = discord.ui.TextInput(
         label="Дополнительная информация", style=discord.TextStyle.paragraph,
@@ -154,7 +154,23 @@ class RolePanel(discord.ui.View):
     @discord.ui.button(label="Запросить роль", emoji="🎭",
                        style=discord.ButtonStyle.danger, custom_id="karateli:role:open")
     async def open_request(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RoleRequestModal())
+        try:
+            await interaction.response.send_modal(RoleRequestModal())
+        except discord.HTTPException:
+            logging.exception("Не удалось открыть форму запроса роли")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "Не удалось открыть форму. Сообщите администрации и повторите попытку.", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logging.exception("Ошибка панели запроса роли: %s", error, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Ошибка панели. Сообщите администрации.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Ошибка панели. Сообщите администрации.", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 class ReviewView(discord.ui.View):
     def __init__(self, request_id):
