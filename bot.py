@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime
+import asyncio
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
@@ -14,6 +15,8 @@ DB_PATH = os.getenv("DB_PATH", "karateli_roles.sqlite3")
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
+
+approval_locks = {}
 
 def db():
     con = sqlite3.connect(DB_PATH)
@@ -59,6 +62,13 @@ def is_reviewer(member: discord.Member):
     role = member.guild.get_role(int(role_id)) if role_id.isdigit() else None
     return role is not None and role in member.roles
 
+def get_role_ids(guild_id):
+    raw = get_setting(guild_id, "target_role_ids") or get_setting(guild_id, "target_role_id")
+    if not raw:
+        return []
+    values = [v.strip() for v in re.split(r"[,;\\s]+", raw) if v.strip()]
+    return list(dict.fromkeys(int(v) for v in values if v.isdigit()))
+
 def make_embed(title, description="", color=0xA30D20):
     e = discord.Embed(title=title, description=description, color=color)
     e.set_footer(text="☠ КАРАТЕЛИ • ЗАПРОС РОЛИ")
@@ -81,6 +91,7 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
         category_id = get_setting(guild.id, "ticket_category_id")
         category = guild.get_channel(int(category_id)) if category_id.isdigit() else None
@@ -114,7 +125,7 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
                 overwrites=overwrites, reason=f"Role request #{request_id}"
             )
         except discord.Forbidden:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "Не удалось создать приватный канал. Проверьте право бота «Управление каналами».",
                 ephemeral=True
             )
@@ -130,7 +141,7 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
         e.add_field(name="Подано", value=now(), inline=True)
         await ticket.send(content=review_role.mention if review_role else None,
                           embed=e, view=ReviewView(request_id))
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Заявка №{request_id} создана. Приватный канал: {ticket.mention}",
             ephemeral=True
         )
@@ -155,80 +166,113 @@ class ReviewView(discord.ui.View):
         if not is_reviewer(interaction.user):
             return await interaction.response.send_message(
                 "⛔ Рассматривать заявки может только старший состав.", ephemeral=True)
-        with db() as con:
-            req = con.execute("SELECT * FROM requests WHERE id=?", (self.request_id,)).fetchone()
-        if not req or req["state"] != "pending":
-            return await interaction.response.send_message("Эта заявка уже обработана.", ephemeral=True)
 
-        member = interaction.guild.get_member(req["user_id"])
-        result_text = "Роли не изменялись."
-        color = 0xD49B26
-        state_label = "НА ДОРАБОТКЕ"
+        # Discord requires a response within 3 seconds. Acknowledge first,
+        # then make Discord API calls in the background of this interaction.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lock = approval_locks.setdefault(self.request_id, asyncio.Lock())
+        async with lock:
+            with db() as con:
+                req = con.execute(
+                    "SELECT * FROM requests WHERE id=? AND guild_id=?",
+                    (self.request_id, interaction.guild_id)).fetchone()
+            if not req or req["state"] != "pending":
+                return await interaction.followup.send(
+                    "Эта заявка уже обработана или не найдена.", ephemeral=True)
 
-        if decision == "approved":
-            if member is None:
-                return await interaction.response.send_message(
-                    "Участник больше не находится на сервере. Заявка не одобрена.", ephemeral=True)
-            role_id = get_setting(interaction.guild_id, "target_role_id")
-            role = interaction.guild.get_role(int(role_id)) if role_id.isdigit() else None
-            if role is None:
-                return await interaction.response.send_message(
-                    "Роль для выдачи не настроена или не найдена. Проверьте `/role_setup`.", ephemeral=True)
+            member = interaction.guild.get_member(req["user_id"])
+            result_text = "Роли не изменялись."
+            color = 0xD49B26
+            state_label = "НА ДОРАБОТКЕ"
+
+            if decision == "approved":
+                if member is None:
+                    try:
+                        member = await interaction.guild.fetch_member(req["user_id"])
+                    except discord.HTTPException:
+                        return await interaction.followup.send(
+                            "Участник отсутствует на сервере. Одобрение невозможно.", ephemeral=True)
+                ids = get_role_ids(interaction.guild_id)
+                if not ids:
+                    return await interaction.followup.send(
+                        "Не указаны роли для выдачи. Настройте их через `/role_setup`.", ephemeral=True)
+                roles = [interaction.guild.get_role(rid) for rid in ids]
+                if any(role is None for role in roles):
+                    return await interaction.followup.send(
+                        "Некоторые ID ролей не найдены на сервере. Проверьте настройки.", ephemeral=True)
+                if any(not role.is_assignable() for role in roles):
+                    return await interaction.followup.send(
+                        "Бот не может выдать одну из ролей. Проверьте иерархию и права бота.", ephemeral=True)
+                try:
+                    # One Discord request rather than one request per role.
+                    new_roles = list({r.id: r for r in [*member.roles, *roles]}.values())
+                    await member.edit(
+                        roles=new_roles, reason=f"Заявка на роль #{self.request_id}")
+                except discord.HTTPException as exc:
+                    return await interaction.followup.send(
+                        f"Не удалось выдать роли: {exc}", ephemeral=True)
+
+                tag = get_setting(interaction.guild_id, "nickname_tag", "Учеб Отдел").strip()
+                new_nick = f"[{tag}] {req['real_name']}"[:32] if tag else req["real_name"][:32]
+                nick_note = ""
+                try:
+                    await member.edit(nick=new_nick, reason=f"Заявка на роль #{self.request_id}")
+                    nick_note = f"\n**Никнейм:** `{new_nick}`"
+                except discord.HTTPException:
+                    nick_note = "\n⚠️ Никнейм изменить не удалось (права или иерархия ролей)."
+                result_text = "Выданы роли: " + ", ".join(r.mention for r in roles) + nick_note
+                color = 0x239B56
+                state_label = "ОДОБРЕНО"
+            elif decision == "rejected":
+                result_text = "Заявка отклонена. Роли не изменялись."
+                color = 0xB42332
+                state_label = "ОТКЛОНЕНО"
+
+            with db() as con:
+                con.execute(
+                    """UPDATE requests SET state=?,reviewer_id=?,reviewer_name=?,decided_at=?
+                       WHERE id=? AND state='pending'""",
+                    (decision, interaction.user.id, interaction.user.display_name,
+                     now(), self.request_id))
+
+            e = make_embed(
+                f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} "
+                f"ЗАЯВКА №{self.request_id} — {state_label}", color=color)
+            e.add_field(name="Участник",
+                        value=f"<@{req['user_id']}> • {req['real_name']}", inline=False)
+            e.add_field(name="Кто заявитель", value=req["member_status"], inline=True)
+            e.add_field(name="Решение принял", value=interaction.user.display_name, inline=True)
+            e.add_field(name="Результат", value=result_text[:1024], inline=False)
+            e.add_field(name="Дата", value=now(), inline=True)
+
             try:
-                await member.add_roles(role, reason=f"Karateli role request #{self.request_id}")
-            except discord.Forbidden:
-                return await interaction.response.send_message(
-                    "Бот не может выдать эту роль. Поднимите роль бота выше целевой роли.", ephemeral=True)
-            tag = get_setting(interaction.guild_id, "nickname_tag", "Учеб Отдел").strip()
-            new_nick = f"[{tag}] {req['real_name']}"[:32]
-            nick_note = ""
-            try:
-                await member.edit(nick=new_nick, reason=f"Karateli role request #{self.request_id}")
-                nick_note = f"\n**Никнейм:** `{new_nick}`"
-            except discord.Forbidden:
-                nick_note = "\n⚠️ Никнейм не изменён: проверьте право управления никнеймами и иерархию ролей."
-            result_text = f"Выдана роль **{role.name}**.{nick_note}"
-            color = 0x239B56
-            state_label = "ОДОБРЕНО"
-        elif decision == "rejected":
-            result_text = "Заявка отклонена. Роли не изменялись."
-            color = 0xB42332
-            state_label = "ОТКЛОНЕНО"
-
-        with db() as con:
-            con.execute("""UPDATE requests SET state=?,reviewer_id=?,reviewer_name=?,decided_at=?
-                           WHERE id=?""",
-                        (decision, interaction.user.id, interaction.user.display_name, now(), self.request_id))
-
-        e = make_embed(f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} ЗАЯВКА №{self.request_id} — {state_label}",
-                       color=color)
-        e.add_field(name="Участник", value=f"<@{req['user_id']}> • {req['real_name']}", inline=False)
-        e.add_field(name="Кто заявитель", value=req["member_status"], inline=True)
-        e.add_field(name="Решение принял", value=interaction.user.display_name, inline=True)
-        e.add_field(name="Результат", value=result_text, inline=False)
-        e.add_field(name="Дата", value=now(), inline=True)
-        await interaction.response.edit_message(embed=e, view=None)
-
-        audit_id = get_setting(interaction.guild_id, "audit_channel_id")
-        audit_channel = interaction.guild.get_channel(int(audit_id)) if audit_id.isdigit() else None
-        if audit_channel:
-            try:
-                await audit_channel.send(embed=e)
+                await interaction.message.edit(embed=e, view=None)
             except discord.HTTPException:
                 pass
+            await interaction.followup.send(
+                f"✅ Заявка №{self.request_id}: {state_label}.", ephemeral=True)
 
-        if member:
-            try:
-                await member.send(embed=make_embed(
-                    f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} РЕШЕНИЕ ПО ЗАПРОСУ РОЛИ",
-                    f"**Заявка:** №{self.request_id}\n"
-                    f"**Кто заявитель:** {req['member_status']}\n"
-                    f"**Решение:** {state_label}\n"
-                    f"**Рассмотрел:** {interaction.user.display_name}\n"
-                    f"**Дата:** {now()}\n\n{result_text}",
-                    color=color))
-            except discord.Forbidden:
-                pass
+            audit_id = get_setting(interaction.guild_id, "audit_channel_id")
+            audit_channel = interaction.guild.get_channel(int(audit_id)) if audit_id.isdigit() else None
+            if audit_channel:
+                try:
+                    await audit_channel.send(embed=e)
+                except discord.HTTPException:
+                    pass
+
+            if member:
+                try:
+                    await member.send(embed=make_embed(
+                        f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} "
+                        "РЕШЕНИЕ ПО ЗАПРОСУ РОЛИ",
+                        f"**Заявка:** №{self.request_id}\n"
+                        f"**Кто заявитель:** {req['member_status']}\n"
+                        f"**Решение:** {state_label}\n"
+                        f"**Рассмотрел:** {interaction.user.display_name}\n"
+                        f"**Дата:** {now()}\n\n{result_text}",
+                        color=color))
+                except discord.HTTPException:
+                    pass
 
     @discord.ui.button(label="Одобрить", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction, button):
@@ -246,20 +290,42 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
     panel_channel = discord.ui.TextInput(label="ID канала панели запроса роли")
     ticket_category = discord.ui.TextInput(label="ID категории приватных заявок")
     reviewer_role = discord.ui.TextInput(label="ID роли старшего состава")
-    target_role = discord.ui.TextInput(label="ID роли, которую выдавать после одобрения")
+    target_role = discord.ui.TextInput(
+        label="ID ролей для выдачи (через запятую)",
+        placeholder="123456789012345678,234567890123456789",
+        style=discord.TextStyle.paragraph, max_length=1000)
     nickname_tag = discord.ui.TextInput(label="Подпись в никнейме", placeholder="Например: Учеб Отдел")
+
+    def __init__(self, guild_id):
+        super().__init__()
+        self.guild_id = guild_id
+        for field, key in [
+            (self.panel_channel, "panel_channel_id"),
+            (self.ticket_category, "ticket_category_id"),
+            (self.reviewer_role, "review_role_id"),
+            (self.target_role, "target_role_ids"),
+            (self.nickname_tag, "nickname_tag")
+        ]:
+            field.default = get_setting(guild_id, key) or (
+                get_setting(guild_id, "target_role_id") if key == "target_role_ids" else "")
 
     async def on_submit(self, interaction):
         fields = [
             (self.panel_channel, "panel_channel_id"),
             (self.ticket_category, "ticket_category_id"),
             (self.reviewer_role, "review_role_id"),
-            (self.target_role, "target_role_id"),
+            (self.target_role, "target_role_ids"),
             (self.nickname_tag, "nickname_tag")
         ]
         for field, key in fields:
             value = field.value.strip()
-            if key != "nickname_tag" and value and not value.isdigit():
+            if key == "target_role_ids":
+                entries = [part.strip() for part in re.split(r"[,;\\s]+", value) if part.strip()]
+                if not entries or len(entries) > 20 or any(not part.isdigit() for part in entries):
+                    return await interaction.response.send_message(
+                        "Укажите от 1 до 20 числовых ID ролей через запятую.", ephemeral=True)
+                value = ",".join(dict.fromkeys(entries))
+            elif key != "nickname_tag" and value and not value.isdigit():
                 return await interaction.response.send_message(
                     f"Поле «{field.label}» должно содержать числовой ID.", ephemeral=True)
             set_setting(interaction.guild_id, key, value)
@@ -290,7 +356,7 @@ class SetupView(discord.ui.View):
     async def setup(self, interaction, button):
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
-        await interaction.response.send_modal(SetupModal())
+        await interaction.response.send_modal(SetupModal(interaction.guild_id))
 
     @discord.ui.button(label="Настроить аудит", emoji="📜", style=discord.ButtonStyle.secondary)
     async def audit(self, interaction, button):
@@ -302,6 +368,10 @@ class KarateliRoleBot(commands.Bot):
     async def setup_hook(self):
         init_db()
         self.add_view(RolePanel())
+        with db() as con:
+            pending = con.execute("SELECT id FROM requests WHERE state='pending'").fetchall()
+        for request in pending:
+            self.add_view(ReviewView(request["id"]))
         await self.tree.sync()
 
 bot = KarateliRoleBot(command_prefix="!", intents=intents)
@@ -317,7 +387,7 @@ async def role_setup(interaction: discord.Interaction):
         return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
     await interaction.response.send_message(
         embed=make_embed("☠ КАРАТЕЛИ | НАСТРОЙКА ЗАПРОСА РОЛИ",
-                         "Настройте канал панели, категорию приватных заявок, проверяющих и одну роль для выдачи."),
+                         "Настройте канал панели, категорию приватных заявок, проверяющих и несколько ролей для выдачи."),
         view=SetupView(), ephemeral=True)
 
 @bot.tree.command(name="role_publish", description="Опубликовать отдельную панель запроса роли")
@@ -329,13 +399,14 @@ async def role_publish(interaction: discord.Interaction):
     channel = interaction.guild.get_channel(int(channel_id)) if channel_id.isdigit() else None
     if channel is None:
         return await interaction.response.send_message("Сначала настройте ID канала через `/role_setup`.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     await channel.send(
         embed=make_embed("🎭 КАРАТЕЛИ | ЗАПРОС РОЛИ",
                          "Нажмите кнопку и заполните заявление.\n\n"
                          "Укажите имя и фамилию, кто вы — новичок, действующий участник или возвращаетесь, "
                          "и при необходимости добавьте информацию. Решение принимает старший состав."),
         view=RolePanel())
-    await interaction.response.send_message(f"✅ Отдельная панель опубликована в {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"✅ Отдельная панель опубликована в {channel.mention}.", ephemeral=True)
 
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и вставьте токен.")
