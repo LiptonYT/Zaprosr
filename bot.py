@@ -70,24 +70,33 @@ def get_role_ids(guild_id):
     values = [v.strip() for v in re.split(r"[,;\s]+", raw) if v.strip()]
     return list(dict.fromkeys(int(v) for v in values if v.isdigit()))
 
-def make_embed(title, description="", color=0xA30D20):
-    e = discord.Embed(title=title, description=description, color=color)
-    e.set_footer(text="☠ КАРАТЕЛИ • ЗАПРОС РОЛИ")
+BRAND_RED = 0xA70F29
+BRAND_GOLD = 0xD5AA56
+BRAND_GREEN = 0x27946A
+BRAND_GRAY = 0x5D6271
+
+def make_embed(title, description="", color=BRAND_RED, guild=None):
+    e = discord.Embed(title=title, description=description, color=color,
+                      timestamp=discord.utils.utcnow())
+    e.set_footer(text="KARATELI  •  FAMILY CONTROL  |  RMRP")
+    if guild and guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
     return e
+
 
 def safe_channel_name(value):
     value = re.sub(r"[^a-zA-Zа-яА-ЯёЁ0-9_-]", "-", value.strip().lower())
     return (value[:45] or "request").strip("-")
 
-class RoleRequestModal(discord.ui.Modal, title="Заявление на получение роли"):
-    real_name = discord.ui.TextInput(label="Имя и фамилия", placeholder="Например: Иван Иванов", max_length=80)
+class RoleRequestModal(discord.ui.Modal, title="☠ Каратели | Заявка на роль"):
+    real_name = discord.ui.TextInput(label="Ваше имя и фамилия", placeholder="Например: Иван Иванов", max_length=80)
     member_status = discord.ui.TextInput(
         label="Ваш статус в семье",
-        placeholder="Новичок / участник / возвращаюсь", max_length=60
+        placeholder="Стажёр / участник / возвращаюсь", max_length=60
     )
     reason = discord.ui.TextInput(
         label="Дополнительная информация", style=discord.TextStyle.paragraph,
-        placeholder="Расскажите немного о себе или укажите нужные сведения",
+        placeholder="При необходимости укажите комментарий для руководства",
         required=False, max_length=500
     )
 
@@ -119,12 +128,17 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
                  self.member_status.value.strip(), self.reason.value.strip(), now()))
             request_id = cur.lastrowid
 
-        e = make_embed("🎭 НОВАЯ ЗАЯВКА НА РОЛЬ", color=0xD49B26)
-        e.add_field(name="Номер", value=f"№{request_id}", inline=True)
-        e.add_field(name="Заявитель", value=f"{interaction.user.mention}\n{self.real_name.value}", inline=True)
-        e.add_field(name="Статус в семье", value=self.member_status.value, inline=True)
-        e.add_field(name="Дополнительно", value=self.reason.value or "Не указано", inline=False)
-        e.add_field(name="Дата подачи", value=now(), inline=True)
+        e = make_embed(
+            "📥  НОВАЯ ЗАЯВКА  •  НА РАССМОТРЕНИИ",
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**КАРАТЕЛИ  /  КАДРОВЫЙ ОТДЕЛ**\n"
+            "Заявка ожидает решения уполномоченного сотрудника.",
+            color=BRAND_GOLD, guild=guild)
+        e.add_field(name="🆔 Номер заявки", value=f"`#{request_id:04d}`", inline=True)
+        e.add_field(name="👤 Заявитель", value=f"{interaction.user.mention}\n**{discord.utils.escape_markdown(self.real_name.value)}**", inline=True)
+        e.add_field(name="🎖️ Статус в семье", value=discord.utils.escape_markdown(self.member_status.value), inline=True)
+        e.add_field(name="📝 Комментарий", value=discord.utils.escape_markdown(self.reason.value) if self.reason.value else "*Без комментария*", inline=False)
+        e.add_field(name="🕒 Отправлено", value=f"<t:{int(discord.utils.utcnow().timestamp())}:f>", inline=False)
         try:
             message = await requests_channel.send(
                 content=review_role.mention if review_role else None,
@@ -140,14 +154,14 @@ class RoleRequestModal(discord.ui.Modal, title="Заявление на полу
         with db() as con:
             con.execute("UPDATE requests SET ticket_id=? WHERE id=?", (message.id, request_id))
         await interaction.followup.send(
-            f"✅ Заявка №{request_id} отправлена в {requests_channel.mention}. Ожидайте решения.",
+            f"✅ **Заявка `#{request_id:04d}` принята!**\nПередана на рассмотрение: {requests_channel.mention}.\nОжидайте решения старшего состава.",
             ephemeral=True)
 
 class RolePanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Запросить роль", emoji="🎭",
+    @discord.ui.button(label="Подать заявку", emoji="📨",
                        style=discord.ButtonStyle.danger, custom_id="karateli:role:open")
     async def open_request(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
@@ -195,7 +209,7 @@ class ReviewView(discord.ui.View):
 
             member = interaction.guild.get_member(req["user_id"])
             result_text = "Роли не изменялись."
-            color = 0xD49B26
+            color = BRAND_GOLD
             state_label = "НА ДОРАБОТКЕ"
 
             if decision == "approved":
@@ -234,11 +248,11 @@ class ReviewView(discord.ui.View):
                 except discord.HTTPException:
                     nick_note = "\n⚠️ Никнейм изменить не удалось (права или иерархия ролей)."
                 result_text = "Выданы роли: " + ", ".join(r.mention for r in roles) + nick_note
-                color = 0x239B56
+                color = BRAND_GREEN
                 state_label = "ОДОБРЕНО"
             elif decision == "rejected":
                 result_text = "Заявка отклонена. Роли не изменялись."
-                color = 0xB42332
+                color = BRAND_RED
                 state_label = "ОТКЛОНЕНО"
 
             with db() as con:
@@ -250,13 +264,15 @@ class ReviewView(discord.ui.View):
 
             e = make_embed(
                 f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} "
-                f"ЗАЯВКА №{self.request_id} — {state_label}", color=color)
-            e.add_field(name="Участник",
+                f"ЗАЯВКА #{self.request_id:04d}  •  {state_label}",
+                "━━━━━━━━━━━━━━━━━━━━\n**КАРАТЕЛИ / РЕШЕНИЕ РУКОВОДСТВА**",
+                color=color, guild=interaction.guild)
+            e.add_field(name="👤 Участник",
                         value=f"<@{req['user_id']}> • {req['real_name']}", inline=False)
-            e.add_field(name="Кто заявитель", value=req["member_status"], inline=True)
-            e.add_field(name="Решение принял", value=interaction.user.display_name, inline=True)
-            e.add_field(name="Результат", value=result_text[:1024], inline=False)
-            e.add_field(name="Дата", value=now(), inline=True)
+            e.add_field(name="🎖️ Статус", value=req["member_status"], inline=True)
+            e.add_field(name="⚖️ Рассмотрел", value=interaction.user.display_name, inline=True)
+            e.add_field(name="📋 Результат", value=result_text[:1024], inline=False)
+            e.add_field(name="🕒 Обработано", value=now(), inline=True)
 
             try:
                 await interaction.message.edit(embed=e, view=None)
@@ -279,7 +295,7 @@ class ReviewView(discord.ui.View):
                 try:
                     await member.send(embed=make_embed(
                         f"{'✅' if decision == 'approved' else '❌' if decision == 'rejected' else '📝'} "
-                        "РЕШЕНИЕ ПО ЗАПРОСУ РОЛИ",
+                        "КАРАТЕЛИ  •  РЕШЕНИЕ ПО ЗАЯВКЕ",
                         f"**Заявка:** №{self.request_id}\n"
                         f"**Кто заявитель:** {req['member_status']}\n"
                         f"**Решение:** {state_label}\n"
@@ -439,8 +455,12 @@ async def role_setup(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
     await interaction.response.send_message(
-        embed=make_embed("☠ КАРАТЕЛИ | НАСТРОЙКА ЗАПРОСА РОЛИ",
-                         "Настройте канал панели, ОТДЕЛЬНЫЙ текстовый канал для поступления заявок, роль проверяющих и выдаваемые роли. Новые каналы бот создавать не будет."),
+        embed=make_embed("☠  КАРАТЕЛИ  |  ПАНЕЛЬ УПРАВЛЕНИЯ",
+                         "**ЦЕНТР УПРАВЛЕНИЯ  /  НАСТРОЙКИ**\n"
+                         "━━━━━━━━━━━━━━━━━━━━\n"
+                         "⚙️ **Настроить бота** — каналы, выдаваемые роли и оформление ника.\n"
+                         "📜 **Настроить аудит** — куда отправлять одобренные заявки.\n\n"
+                         "*Заявки публикуются в существующем канале — новые каналы не создаются.*"),
         view=SetupView(), ephemeral=True)
 
 @bot.tree.command(name="role_publish", description="Опубликовать отдельную панель запроса роли")
@@ -454,10 +474,19 @@ async def role_publish(interaction: discord.Interaction):
         return await interaction.response.send_message("Сначала настройте ID канала через `/role_setup`.", ephemeral=True)
     await interaction.response.defer(ephemeral=True, thinking=True)
     await channel.send(
-        embed=make_embed("🎭 КАРАТЕЛИ | ЗАПРОС РОЛИ",
-                         "Нажмите кнопку и заполните заявление.\n\n"
-                         "Укажите имя и фамилию, кто вы — новичок, действующий участник или возвращаетесь, "
-                         "и при необходимости добавьте информацию. Решение принимает старший состав."),
+        embed=make_embed(
+            "☠  КАРАТЕЛИ  |  ЗАПРОС РОЛИ",
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "**ДОБРО ПОЖАЛОВАТЬ В СЕМЬЮ**\n"
+            "Оформи заявку на получение ролей и доступов нашего Discord-сервера.\n\n"
+            "**01**  Нажми **«Подать заявку»**.\n"
+            "**02**  Введи имя, фамилию и статус в семье.\n"
+            "**03**  Дождись решения старшего состава.\n\n"
+            "✅ После одобрения роли выдаются автоматически.\n"
+            "📩 Результат придёт в личные сообщения.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "*Дисциплина. Единство. Уважение.*",
+            color=BRAND_RED, guild=interaction.guild),
         view=RolePanel())
     await interaction.followup.send(f"✅ Отдельная панель опубликована в {channel.mention}.", ephemeral=True)
 
