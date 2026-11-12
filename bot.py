@@ -248,7 +248,6 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
     reviewer_role = discord.ui.TextInput(label="ID роли старшего состава")
     target_role = discord.ui.TextInput(label="ID роли, которую выдавать после одобрения")
     nickname_tag = discord.ui.TextInput(label="Подпись в никнейме", placeholder="Например: Учеб Отдел")
-    audit_channel = discord.ui.TextInput(label="ID канала аудита", required=False)
 
     async def on_submit(self, interaction):
         fields = [
@@ -256,8 +255,7 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
             (self.ticket_category, "ticket_category_id"),
             (self.reviewer_role, "review_role_id"),
             (self.target_role, "target_role_id"),
-            (self.nickname_tag, "nickname_tag"),
-            (self.audit_channel, "audit_channel_id")
+            (self.nickname_tag, "nickname_tag")
         ]
         for field, key in fields:
             value = field.value.strip()
@@ -266,6 +264,23 @@ class SetupModal(discord.ui.Modal, title="Настройки бота запро
                     f"Поле «{field.label}» должно содержать числовой ID.", ephemeral=True)
             set_setting(interaction.guild_id, key, value)
         await interaction.response.send_message("✅ Настройки сохранены.", ephemeral=True)
+
+
+class AuditModal(discord.ui.Modal, title="Настройка канала аудита"):
+    audit_channel = discord.ui.TextInput(label="ID канала аудита", placeholder="Вставьте ID текстового канала")
+
+    async def on_submit(self, interaction):
+        value = self.audit_channel.value.strip()
+        if not value.isdigit():
+            return await interaction.response.send_message(
+                "ID канала должен состоять только из цифр.", ephemeral=True)
+        channel = interaction.guild.get_channel(int(value))
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "Текстовый канал с таким ID не найден на этом сервере.", ephemeral=True)
+        set_setting(interaction.guild_id, "audit_channel_id", value)
+        await interaction.response.send_message(
+            f"✅ Канал аудита установлен: {channel.mention}", ephemeral=True)
 
 class SetupView(discord.ui.View):
     def __init__(self):
@@ -276,6 +291,12 @@ class SetupView(discord.ui.View):
         if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
         await interaction.response.send_modal(SetupModal())
+
+    @discord.ui.button(label="Настроить аудит", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def audit(self, interaction, button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("Нужно право «Управление сервером».", ephemeral=True)
+        await interaction.response.send_modal(AuditModal())
 
 class KarateliRoleBot(commands.Bot):
     async def setup_hook(self):
