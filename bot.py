@@ -1,4 +1,6 @@
 import os
+import json
+from pathlib import Path
 import re
 import sqlite3
 from datetime import datetime
@@ -18,6 +20,37 @@ intents.guilds = True
 intents.members = True
 
 approval_locks = {}
+
+BLACKLIST_DENIED = "⛔ Участник в чёрном списке ПГО КАРАТЕЛИ. Подать или одобрить заявку нельзя."
+BLACKLIST_UNAVAILABLE = "⚠️ Проверка чёрного списка недоступна. Сообщите старшему составу и попробуйте позже."
+
+
+def blacklist_role(guild):
+    try:
+        config = json.loads(Path(__file__).with_name("blacklist.json").read_text(encoding="utf-8"))
+        if int(config["guild_id"]) != guild.id:
+            return None
+        role = guild.get_role(int(config["role_id"]))
+        return role if role and not role.is_default() else None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def blacklist_notice(guild, member):
+    role = blacklist_role(guild)
+    if role is None or not isinstance(member, discord.Member):
+        return BLACKLIST_UNAVAILABLE
+    return BLACKLIST_DENIED if role in member.roles else None
+
+
+async def checked_member(guild, member_id):
+    try:
+        member = await guild.fetch_member(member_id)
+    except discord.NotFound:
+        return None, "⛔ Участник больше не на сервере."
+    except (discord.HTTPException, AttributeError):
+        return None, BLACKLIST_UNAVAILABLE
+    return member, blacklist_notice(guild, member)
 
 def db():
     con = sqlite3.connect(DB_PATH)
@@ -159,6 +192,9 @@ class RoleRequestModal(discord.ui.Modal, title="☠ Каратели | Заяв�
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
+        _, notice = await checked_member(guild, interaction.user.id)
+        if notice:
+            return await interaction.followup.send(notice, ephemeral=True)
         # All applications go to ONE configured text channel, without ticket creation.
         requests_channel_id = get_setting(guild.id, "applications_channel_id")
         requests_channel = guild.get_channel(int(requests_channel_id)) if requests_channel_id.isdigit() else None
@@ -221,6 +257,9 @@ class RolePanel(discord.ui.View):
                        style=discord.ButtonStyle.danger, custom_id="karateli:role:open")
     async def open_request(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
+            notice = blacklist_notice(interaction.guild, interaction.user)
+            if notice:
+                return await interaction.response.send_message(notice, ephemeral=True)
             await interaction.response.send_modal(RoleRequestModal())
         except discord.HTTPException:
             logging.exception("Не удалось открыть форму запроса роли")
@@ -272,13 +311,14 @@ class ReviewView(discord.ui.View):
             state_label = "НА ДОРАБОТКЕ"
 
             if decision == "approved":
-                if member is None:
-                    try:
-                        member = await interaction.guild.fetch_member(req["user_id"])
-                    except discord.HTTPException:
-                        return await interaction.followup.send(
-                            "Участник отсутствует на сервере. Одобрение невозможно.", ephemeral=True)
+                member, notice = await checked_member(interaction.guild, req["user_id"])
+                if notice:
+                    return await interaction.followup.send(notice, ephemeral=True)
                 ids = get_role_ids(interaction.guild_id)
+                blocked_role = blacklist_role(interaction.guild)
+                if blocked_role is None or blocked_role.id in ids:
+                    return await interaction.followup.send(
+                        "⚠️ Роль чёрного списка нельзя настроить как роль для выдачи.", ephemeral=True)
                 if not ids:
                     return await interaction.followup.send(
                         "Не указаны роли для выдачи. Настройте их через `/role_setup`.", ephemeral=True)
@@ -289,14 +329,25 @@ class ReviewView(discord.ui.View):
                 if any(not role.is_assignable() for role in roles):
                     return await interaction.followup.send(
                         "Бот не может выдать одну из ролей. Проверьте иерархию и права бота.", ephemeral=True)
+                added = []
                 try:
-                    # One Discord request rather than one request per role.
-                    new_roles = list({r.id: r for r in [*member.roles, *roles]}.values())
-                    await member.edit(
-                        roles=new_roles, reason=f"Заявка на роль #{self.request_id}")
-                except discord.HTTPException as exc:
-                    return await interaction.followup.send(
-                        f"Не удалось выдать роли: {exc}", ephemeral=True)
+                    for role in roles:
+                        if role not in member.roles:
+                            await member.add_roles(role, atomic=True, reason=f"Заявка на роль #{self.request_id}")
+                            added.append(role)
+                    _, notice = await checked_member(interaction.guild, member.id)
+                except discord.HTTPException:
+                    notice = "Не удалось выдать все роли. Проверьте права бота."
+                if notice:
+                    try:
+                        if added:
+                            await member.remove_roles(*added, atomic=True, reason="Отмена выдачи по заявке")
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException:
+                        logging.exception("Не удалось отменить частичную выдачу заявки %s", self.request_id)
+                        notice += " ⚠️ Проверьте роли участника вручную."
+                    return await interaction.followup.send(notice, ephemeral=True)
 
                 tag = get_setting(interaction.guild_id, "nickname_tag", "Учеб Отдел").strip()
                 new_nick = f"[{tag}] {req['real_name']}"[:32] if tag else req["real_name"][:32]
@@ -550,6 +601,7 @@ async def role_publish(interaction: discord.Interaction):
         view=RolePanel())
     await interaction.followup.send(f"✅ Отдельная панель опубликована в {channel.mention}.", ephemeral=True)
 
-if not TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и вставьте токен.")
-bot.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN. Скопируйте .env.example в .env и вставьте токен.")
+    bot.run(TOKEN)
